@@ -1,173 +1,225 @@
+/*
+  Программа для управления системой измерения каталитической активности
+  с использованием светодиодного излучения и датчика освещенности.
+  Включает управление ультрафиолетовым диодом, красным лазером,
+  запись данных на SD-карту и управление через последовательный порт.
+*/
+
 #include <Wire.h>
 #include <BH1750.h>
 #include <SPI.h>
-#include <SdFat.h> //Why not SD.h ?
-//#include <SD.h>
+#include <SdFat.h>
 #include <SoftwareSerial.h>
 #include <GParser.h>
 
-#define RED_LASER 7
-#define UV_DIODE 8
+// Конфигурация пинов
+#define RED_LASER_PIN 7
+#define UV_DIODE_PIN 8
 #define SD_CS_PIN 10
 
-//----OBJECTS----//
-SoftwareSerial mySerial(3, 2); // RX, TX
-File myFile;
-BH1750 lightMeter;
-SdFat SD;
+// Объекты периферии
+SoftwareSerial mySerial(3, 2);    // RX, TX для внешнего управления
+File dataFile;                    // Файл для записи данных
+BH1750 lightMeter;                // Датчик освещенности
+SdFat sdCard;                     // Карта памяти
 
-//----VARIABLES----//
-uint32_t timeAd = 6000;
-uint32_t timeCat = 10000;
-uint32_t timeMsr = 2000;
-uint32_t timePrc = 0;
-int amountCat = 5;
-int amountAd = 3;
-int counter = 0;
-bool flagCat = false;
-bool flagErrorLight = false;
-bool flagErrorSD = false;
-String fileNameTxt = "";
+// Глобальные переменные
+uint32_t adsorptionTime = 6000;     // Время адсорбции (мс)
+uint32_t catalysisTime = 10000;     // Общее время катализа (мс)
+uint32_t measurementInterval = 2000; // Интервал измерений (мс)
+uint32_t previousTime = 0;          // Время предыдущего измерения
+int catalysisCycles = 5;           // Количество циклов катализа
+int adsorptionCycles = 3;          // Количество циклов адсорбции
+int cycleCounter = 0;              // Счетчик циклов
+bool isCatalysisActive = false;    // Флаг активности катализа
+bool isLightError = false;         // Флаг ошибки датчика света
+bool isSdError = false;            // Флаг ошибки SD-карты
+String dataFileName = "";          // Имя файла для данных
 
-
-void setup() 
-{
-
-  Serial.begin(9600);
-  mySerial.begin(9600);
-    while (!Serial) {
-    ; // wait for serial port to connect. Needed for native USB port only
+/**
+ * Чтение уровня освещенности с усреднением.
+ * @return Среднее значение освещенности (люкс)
+ */
+float measureLightLevel() {
+  float totalLight = 0;
+  for (int i = 0; i < 10; i++) {
+    if (lightMeter.measurementReady()) {
+      totalLight += lightMeter.readLightLevel();
+    }
+    delay(100);
   }
-  Wire.begin();
-  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-
-  pinMode(RED_LASER, OUTPUT);
-  pinMode(UV_DIODE, OUTPUT);
-  digitalWrite(UV_DIODE, LOW);
-  digitalWrite(RED_LASER, LOW);
-
-  Serial.print("Initializing SD card...");
- 
-  // if (!SD.begin(SD2_CONFIG)) {
-  if (!SD.begin(SD_CS_PIN)) {
-      Serial.println("initialization failed!");
-    return;
-  }
-  Serial.println("initialization done.");
+  return totalLight / 10.0;
 }
 
-void loop() 
-{
+/**
+ * Запись данных измерения в файл на SD-карте.
+ * @param cycleNumber Номер текущего цикла
+ * @param lightLevel Измеренный уровень освещенности
+ */
+void writeDataToFile(int cycleNumber, float lightLevel) {
+  dataFile = sdCard.open(dataFileName, FILE_WRITE);
+  if (dataFile) {
+    dataFile.println(String(cycleNumber) + '\t' + 
+                     String(millis() - previousTime) + '\t' + 
+                     String(lightLevel));
+    dataFile.close();
+    Serial.println("Данные записаны.");
+  } else {
+    Serial.println("Ошибка открытия файла!");
+    isSdError = true;
+  }
+}
 
-if (mySerial.available())     //---PARSING---//
-  {
-    char data[200];
-    int amount = mySerial.readBytesUntil(';',data,200); //until terminator //возвращает колличество принятых байт
-    data[amount] = NULL;
-    Serial.println(data);
-    GParser dataG(data, ',');
-    int am = dataG.split();
+/**
+ * Отправка данных через последовательный порт.
+ * @param lightLevel Измеренный уровень освещенности
+ */
+void sendDataViaSerial(float lightLevel) {
+  mySerial.println(lightLevel);
+}
 
-    switch (dataG.getInt(0))
-    {
-      case 369: // SET SETTINGS
-        timeAd = dataG.getInt(1); // Адсорбция
-        timeCat = dataG.getInt(2); // общее время
-        timeMsr = dataG.getInt(3); // измерять каждые n минут
-        fileNameTxt = dataG[4];
-        amountCat=timeCat/timeMsr;
-        amountAd=timeAd/timeMsr;
-        mySerial.println("Adsorption: " + String(timeAd) + "; Catalysis: " + String(timeCat) + "; Measure: " + String(timeMsr) + "; File: " + String(fileNameTxt));
-        break;
+/**
+ * Обработка начального измерения (нулевой цикл).
+ */
+void performInitialMeasurement() {
+  digitalWrite(UV_DIODE_PIN, LOW);
+  digitalWrite(RED_LASER_PIN, HIGH);
+  
+  float lightLevel = measureLightLevel();
+  
+  digitalWrite(RED_LASER_PIN, LOW);
+  writeDataToFile(cycleCounter, lightLevel);
+  sendDataViaSerial(lightLevel);
+  
+  cycleCounter++;
+}
 
-      case 1: // START 
-        flagCat = true;
-        mySerial.println("Measurements has been started");
+/**
+ * Обработка регулярных измерений.
+ */
+void performRegularMeasurement() {
+  if (millis() - previousTime >= measurementInterval) {
+    previousTime = millis();
+    
+    digitalWrite(UV_DIODE_PIN, LOW);
+    digitalWrite(RED_LASER_PIN, HIGH);
+    
+    float lightLevel = measureLightLevel();
+    
+    digitalWrite(RED_LASER_PIN, LOW);
+    writeDataToFile(cycleCounter, lightLevel);
+    sendDataViaSerial(lightLevel);
+    
+    cycleCounter++;
+  }
+}
+
+/**
+ * Обработка входящих команд через последовательный порт.
+ */
+void processIncomingCommands() {
+  if (mySerial.available()) {
+    char buffer[200];
+    int bytesReceived = mySerial.readBytesUntil(';', buffer, 200);
+    buffer[bytesReceived] = '\0';
+    
+    Serial.println(buffer);
+    
+    GParser parser(buffer, ',');
+    int parametersCount = parser.split();
+    
+    switch (parser.getInt(0)) {
+      case 369: // Установка параметров
+        adsorptionTime = parser.getInt(1);
+        catalysisTime = parser.getInt(2);
+        measurementInterval = parser.getInt(3);
+        dataFileName = parser[4];
+        catalysisCycles = catalysisTime / measurementInterval;
+        adsorptionCycles = adsorptionTime / measurementInterval;
+        
+        mySerial.println("Адсорбция: " + String(adsorptionTime) + 
+                        "; Катализ: " + String(catalysisTime) + 
+                        "; Измерение: " + String(measurementInterval) + 
+                        "; Файл: " + String(dataFileName));
         break;
         
-      case 2: // STOP
-        flagCat = false;
-        mySerial.println("Measurements has been breaked");
+      case 1: // Запуск измерений
+        isCatalysisActive = true;
+        mySerial.println("Измерения начаты");
         break;
-
-      case 3: // Red On
-        digitalWrite(RED_LASER, HIGH);
-        float measM;
-        if (lightMeter.measurementReady()) { measM = lightMeter.readLightLevel(); }
-        mySerial.println(measM);
+        
+      case 2: // Остановка измерений
+        isCatalysisActive = false;
+        mySerial.println("Измерения остановлены");
         break;
-
-      case 4: // Red off
-        digitalWrite(RED_LASER, LOW);
+        
+      case 3: // Включение красного лазера
+        digitalWrite(RED_LASER_PIN, HIGH);
+        if (lightMeter.measurementReady()) {
+          mySerial.println(lightMeter.readLightLevel());
+        }
+        break;
+        
+      case 4: // Выключение красного лазера
+        digitalWrite(RED_LASER_PIN, LOW);
         break;
     }
-  
   }
-
-
-if (flagCat==true)
-{
-  if (counter == 0)
-  {
-    digitalWrite(UV_DIODE, LOW);
-    digitalWrite(RED_LASER, HIGH);
-    float meas = 0;
-    for (int i = 0; i<10; i++) //make 10 measurements
-    {
-      if (lightMeter.measurementReady()) { meas = meas + lightMeter.readLightLevel(); }
-      delay(100);
-    }
-    digitalWrite(RED_LASER, LOW);
-    float measM = meas/10; //average result
-      
-    myFile = SD.open(fileNameTxt, FILE_WRITE);
-    if (myFile) 
-    {
-      myFile.println(String(counter) + '\t' + String(millis()-timePrc) + '\t' + String(measM));
-      myFile.close();
-      Serial.println("done.");
-    } 
-    else 
-    {
-      // if the file didn't open, print an error:
-      Serial.println("error opening test.txt");
-    }
-    mySerial.println(measM);
-    counter++;
-  }
-  if (counter>amountAd) { digitalWrite(UV_DIODE, HIGH); }
-  if (millis() - timePrc >= timeMsr) 
-  {
-    timePrc = millis();
-    digitalWrite(UV_DIODE, LOW);
-    digitalWrite(RED_LASER, HIGH);
-    float meas = 0;
-    for (int i = 0; i<10; i++)
-    {
-      if (lightMeter.measurementReady()) { meas = meas + lightMeter.readLightLevel(); }
-      delay(100);
-    }
-    digitalWrite(RED_LASER, LOW);
-    float measM = meas/10;
-      
-    myFile = SD.open(fileNameTxt, FILE_WRITE);
-    if (myFile) {
-    myFile.println(String(counter) + '\t' + String(millis()-timePrc) + '\t' + String(measM));
-    myFile.close();
-    Serial.println("done.");
-    } 
-    else 
-    {
-      // if the file didn't open, print an error:
-      Serial.println("error opening test.txt");
-    }
-    mySerial.println(measM);
-    counter++;
-  }
-  if (counter>(amountCat+amountAd)) { flagCat = false; }
-
-}
-  
 }
 
+/**
+ * Основной цикл измерений.
+ */
+void runMeasurementCycle() {
+  if (isCatalysisActive) {
+    if (cycleCounter == 0) {
+      performInitialMeasurement();
+    }
+    
+    if (cycleCounter > adsorptionCycles) {
+      digitalWrite(UV_DIODE_PIN, HIGH);
+    }
+    
+    performRegularMeasurement();
+    
+    if (cycleCounter > (catalysisCycles + adsorptionCycles)) {
+      isCatalysisActive = false;
+    }
+  }
+}
 
+/**
+ * Инициализация системы.
+ */
+void setup() {
+  Serial.begin(9600);
+  mySerial.begin(9600);
+  
+  while (!Serial) {
+    ; // Ожидание подключения последовательного порта
+  }
+  
+  Wire.begin();
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+  
+  pinMode(RED_LASER_PIN, OUTPUT);
+  pinMode(UV_DIODE_PIN, OUTPUT);
+  digitalWrite(UV_DIODE_PIN, LOW);
+  digitalWrite(RED_LASER_PIN, LOW);
+  
+  Serial.print("Инициализация SD карты...");
+  if (!sdCard.begin(SD_CS_PIN)) {
+    Serial.println("Ошибка инициализации!");
+    isSdError = true;
+    return;
+  }
+  Serial.println("Готово.");
+}
+
+/**
+ * Главный цикл программы.
+ */
+void loop() {
+  processIncomingCommands();
+  runMeasurementCycle();
+}
